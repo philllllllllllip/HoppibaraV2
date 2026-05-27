@@ -72,6 +72,40 @@ document.addEventListener("DOMContentLoaded", () => {
     onGamepadConnect(gp    => { gamepad = gp; });
     onGamepadDisconnect(() => { gamepad = null; });
 
+    // ── Rainbow credits canvas overlay (shown on menu + persistent) ──────────
+    function addRainbowCredits() {
+        // Remove any existing overlay first
+        const existing = document.getElementById("rainbow-credits");
+        if (existing) existing.remove();
+
+        const div = document.createElement("div");
+        div.id = "rainbow-credits";
+        div.style.cssText = [
+            "position:fixed",
+            "bottom:10px",
+            "left:0",
+            "width:100%",
+            "text-align:center",
+            "font-size:clamp(11px,1.4vw,16px)",
+            "font-family:sans-serif",
+            "font-weight:bold",
+            "pointer-events:none",
+            "z-index:9999",
+            "letter-spacing:0.04em",
+        ].join(";");
+
+        const text = "Made by SoundGod. Added on to by Lemon.";
+        const colors = ["#ff4444","#ff8800","#ffdd00","#44dd44","#44aaff","#aa44ff","#ff44cc"];
+        let html = "";
+        for (let i = 0; i < text.length; i++) {
+            const c = colors[i % colors.length];
+            html += `<span style="color:${c};text-shadow:0 1px 3px rgba(0,0,0,0.35)">${text[i] === " " ? "&nbsp;" : text[i]}</span>`;
+        }
+        div.innerHTML = html;
+        document.body.appendChild(div);
+    }
+    addRainbowCredits();
+
     scene("changeDeviceOri", () => {
         add([
             text("Please rotate your device or use a tablet/computer", { font: "baifont", width: width() * 0.8 }),
@@ -83,6 +117,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const s = loadSettings();
         applyBg(s.bgColor);
         stopMusic();
+        addRainbowCredits();
         add([rect(width(), height()), pos(0,0), color(0,0,0), opacity(0.55), z(0)]);
         const cx = width()/2, cy = height()/2;
         const bC = rgb(107,64,1), fC = rgb(179,120,33);
@@ -105,6 +140,7 @@ document.addEventListener("DOMContentLoaded", () => {
     scene("settings", () => {
         let s = loadSettings();
         applyBg(s.bgColor);
+        addRainbowCredits();
         const cx = width()/2, cy = height()/2;
         const bC = rgb(107,64,1), fC = rgb(179,120,33), wh = rgb(255,255,255);
         add([rect(width(), height()), pos(0,0), color(bC), z(0)]);
@@ -187,6 +223,10 @@ document.addEventListener("DOMContentLoaded", () => {
         let isRotating = false;
         let rotation   = 0;
 
+        // Track held keys ourselves so we can suppress during pause
+        let leftHeld  = false;
+        let rightHeld = false;
+
         function switchSprite() {
             currentSpr = currentSpr === "capybara" ? "capybara2" : "capybara";
             player.use(sprite(currentSpr));
@@ -215,11 +255,13 @@ document.addEventListener("DOMContentLoaded", () => {
         floorSegs.push(makeFloor(0));
         floorSegs.push(makeFloor(width()));
 
+        // ── Player with tight hitbox (offset inward so feet/body match) ────────
         const player = add([
             sprite("capybara"),
             pos(120, height()-FLOOR_H-60),
             anchor("center"),
-            area(),
+            // Shrink hitbox: narrower and shorter than the sprite visual
+            area({ shape: new Rect(vec2(-28, -22), 56, 50) }),
             body(),
             z(5),
         ]);
@@ -240,6 +282,10 @@ document.addEventListener("DOMContentLoaded", () => {
         let pauseObjs = [];
         function showPause() {
             isPaused = true;
+            // Stop all held movement
+            leftHeld  = false;
+            rightHeld = false;
+            stopWalkAnim();
             if (bgMusic) { try { bgMusic.paused = true; } catch(e) {} }
             const bC = rgb(107,64,1), fC = rgb(179,120,33), wh = rgb(255,255,255);
             pauseObjs.push(
@@ -273,11 +319,12 @@ document.addEventListener("DOMContentLoaded", () => {
         onKeyPress("p",      togglePause);
         onKeyPress("escape", togglePause);
 
+        // ── Hazard spawn with tight hitbox ─────────────────────────────────────
         function spawnHazard() {
             if (gameOver) return;
             add([
                 sprite("hazard"+(Math.floor(Math.random()*4)+1)),
-                area(),
+                area({ shape: new Rect(vec2(-20, -40), 40, 50) }),
                 pos(width()+10, height()-FLOOR_H),
                 anchor("botleft"),
                 move(LEFT, HAZARD_SPD),
@@ -309,35 +356,54 @@ document.addEventListener("DOMContentLoaded", () => {
                 startWalkAnim();
             }
         }
+
+        // Key tracking — only react when not paused/gameover
+        onKeyPress("left",  () => { leftHeld  = true; });
+        onKeyPress("right", () => { rightHeld = true; });
+        onKeyRelease("left",  () => { leftHeld  = false; if (!rightHeld) stopWalkAnim(); });
+        onKeyRelease("right", () => { rightHeld = false; if (!leftHeld)  stopWalkAnim(); });
         onKeyDown("space", jump);
         onKeyDown("up",    jump);
-        onKeyDown("left",  () => { if (isPaused||gameOver) return; if (player.pos.x > 0) { player.move(-MOVE_SPD,0); startWalkAnim(); } });
-        onKeyDown("right", () => { if (isPaused||gameOver) return; if (player.pos.x < width()) { player.move(MOVE_SPD,0); startWalkAnim(); } });
-        onKeyRelease("left",  stopWalkAnim);
-        onKeyRelease("right", stopWalkAnim);
 
         onUpdate(() => {
-            if (isPaused || gameOver) return;
-            floorSegs.forEach((seg, i) => {
-                seg.pos.x -= SCROLL_SPD * dt();
-                if (seg.pos.x + width() < 0) {
-                    const other = floorSegs[(i+1)%2];
-                    seg.pos.x = other.pos.x + width();
-                }
-            });
+            if (gameOver) return;
+
+            // ── Floor scrolling (always scrolls, pausing means player can't dodge)
+            // Actually stop floor scroll on pause so game is truly frozen
+            if (!isPaused) {
+                floorSegs.forEach((seg, i) => {
+                    seg.pos.x -= SCROLL_SPD * dt();
+                    if (seg.pos.x + width() < 0) {
+                        const other = floorSegs[(i+1)%2];
+                        seg.pos.x = other.pos.x + width();
+                    }
+                });
+            }
+
+            if (isPaused) return; // ← hard stop: no movement, no rotation, nothing
+
+            // Keyboard movement
+            if (leftHeld  && player.pos.x > 0)      { player.move(-MOVE_SPD, 0); startWalkAnim(); }
+            if (rightHeld && player.pos.x < width()) { player.move( MOVE_SPD, 0); startWalkAnim(); }
+            if (!leftHeld && !rightHeld) {
+                if (player.isGrounded() && walkTimer) stopWalkAnim();
+            }
+
+            // Rotation on jump
             if (isRotating) {
                 player.angle += 11;
                 rotation += 11;
                 if (rotation >= 360) { player.angle = 0; isRotating = false; }
             }
-            if (player.isGrounded() && walkTimer && !isKeyDown("left") && !isKeyDown("right")) stopWalkAnim();
+
+            // Gamepad
             if (gamepad) {
                 const stick = gamepad.getStick("left");
                 if (gamepad.isPressed("south")) jump();
                 if (Math.abs(stick.x) > 0.15) {
                     if (player.pos.x >= 0 && player.pos.x <= width()) { player.move(stick.x*MOVE_SPD,0); startWalkAnim(); }
                 } else {
-                    if (!isKeyDown("left") && !isKeyDown("right")) stopWalkAnim();
+                    if (!leftHeld && !rightHeld) stopWalkAnim();
                 }
             }
         });
@@ -368,7 +434,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 if (isPaused || gameOver) return;
                 if (lHeld && player.pos.x > 0)      { player.move(-MOVE_SPD,0); startWalkAnim(); }
                 if (rHeld && player.pos.x < width()) { player.move( MOVE_SPD,0); startWalkAnim(); }
-                if (!lHeld && !rHeld && !isKeyDown("left") && !isKeyDown("right")) stopWalkAnim();
+                if (!lHeld && !rHeld && !leftHeld && !rightHeld) stopWalkAnim();
             });
         }
     });
@@ -377,15 +443,17 @@ document.addEventListener("DOMContentLoaded", () => {
         const s = loadSettings();
         applyBg(s.bgColor);
         startMusic(s.musicVol);
+        addRainbowCredits();
 
         const sw = width(), sh = height();
         const mobile = WURFL.is_mobile;
 
+        // ── Logo — nudged up a little more ────────────────────────────────────
         const logoS = Math.min(sw, sh) / 1400;
         add([
             sprite(mobile ? "hoppibara" : "hoppibara2"),
             scale(logoS),
-            pos(sw - 16, 16),
+            pos(sw - 16, 6),        // was 16, now 6 → higher
             anchor("topright"),
             z(2),
         ]);
@@ -408,27 +476,42 @@ document.addEventListener("DOMContentLoaded", () => {
             z(3),
         ]);
 
-        const panelX = mobile ? sw * 0.68 : sw * 0.62;
+        // ── Buttons — side by side, centred on panel ──────────────────────────
+        const panelX  = mobile ? sw * 0.68 : sw * 0.62;
         const panelCY = sh * 0.50;
         const btnSize = mobile ? 70 : 85;
+        const btnGap  = 20; // gap between the two buttons
+        const totalBtnW = btnSize * 2 + btnGap;
+        const playX     = panelX - btnSize/2 - btnGap/2;
+        const settX     = panelX + btnSize/2 + btnGap/2;
 
+        // Play button
         const playBtn = add([
-            rect(btnSize, btnSize), pos(panelX, panelCY - 70),
+            rect(btnSize, btnSize),
+            pos(playX, panelCY + 30),
             anchor("center"), color(179,120,33), outline(6), z(10), area(),
         ]);
-        add([sprite("playIcon"), pos(panelX, panelCY-70), anchor("center"), z(11)]);
+        add([sprite("playIcon"), pos(playX, panelCY+30), anchor("center"), z(11)]);
 
-        add([
-            text(`High Score: ${localStorage.getItem("highScore")}`,{font:"baifont"}),
-            pos(panelX, panelCY+20), scale(1.0), anchor("center"), color(80,40,0), z(11),
-        ]);
-
+        // Settings button — same row, right next to play
         const settingsBtn = add([
-            rect(btnSize, btnSize), pos(panelX, panelCY+130),
+            rect(btnSize, btnSize),
+            pos(settX, panelCY + 30),
             anchor("center"), color(107,64,1), outline(6), z(10), area(),
         ]);
-        add([text("\u2699",{font:"baifont"}), scale(1.4), pos(panelX, panelCY+130), anchor("center"), color(255,255,255), z(11)]);
+        add([text("\u2699",{font:"baifont"}), scale(1.4), pos(settX, panelCY+30), anchor("center"), color(255,255,255), z(11)]);
 
+        // Labels under each button
+        add([text("Play",{font:"baifont"}),     scale(0.65), pos(playX, panelCY+30+btnSize/2+14), anchor("center"), color(80,40,0), z(11)]);
+        add([text("Settings",{font:"baifont"}), scale(0.55), pos(settX, panelCY+30+btnSize/2+14), anchor("center"), color(80,40,0), z(11)]);
+
+        // High score above the buttons
+        add([
+            text(`High Score: ${localStorage.getItem("highScore")}`,{font:"baifont"}),
+            pos(panelX, panelCY - 30), scale(1.0), anchor("center"), color(80,40,0), z(11),
+        ]);
+
+        // Hover effects
         playBtn.onHover(()        => { playBtn.color = rgb(210,145,50); });
         playBtn.onHoverEnd(()     => { playBtn.color = rgb(179,120,33); });
         settingsBtn.onHover(()    => { settingsBtn.color = rgb(140,85,5); });
